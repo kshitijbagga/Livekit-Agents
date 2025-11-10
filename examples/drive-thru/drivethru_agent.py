@@ -31,12 +31,18 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     function_tool,
+    RoomInputOptions,
 )
-from livekit.plugins import cartesia, deepgram, openai, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+import livekit.plugins.silero as silero
+import livekit.plugins.noise_cancellation as noise_cancellation
+
+# import livekit.plugins 
+# import noise_cancellation, cartesia, deepgram, openai # silero
+# from livekit.plugins.turn_detector import multilingual as ml
 
 # === NEW IMPORT ===
-from agents.extensions.interrupt_handler import InterruptHandler
+from interrupt_handler import InterruptHandler
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -91,8 +97,8 @@ class DriveThruAgent(Agent):
                 self.build_happy_order_tool(
                     userdata.happy_items, userdata.drink_items, userdata.sauce_items
                 ),
-                self.remove_order_item,
-                self.list_order_items,
+                # self.remove_order_item,
+                # self.list_order_items_1,
             ],
         )
 
@@ -234,7 +240,7 @@ class DriveThruAgent(Agent):
         return "Removed:\n" + "\n".join(item.model_dump_json() for item in removed)
 
     @function_tool
-    async def list_order_items(self, ctx: RunContext[Userdata]) -> str:
+    async def list_order_items_1(self, ctx: RunContext[Userdata]) -> str:
         items = ctx.userdata.order.items.values()
         if not items:
             return "The order is empty"
@@ -270,36 +276,48 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect()
     userdata = await new_userdata()
 
-    interrupt_handler = InterruptHandler(ignored_words=['uh', 'umm', 'hmm', 'haan'])
+    interrupt_handler = InterruptHandler(ignored_words=["uh", "umm", "hmm", "haan"])
 
-    session = AgentSession[Userdata](
+    session = AgentSession(
         userdata=userdata,
-        stt=deepgram.STT(model="nova-3"),
-        llm=openai.LLM(model="gpt-4o", parallel_tool_calls=False, temperature=0.45),
-        tts=cartesia.TTS(voice="f786b574-daa5-4673-aa0c-cbe3e8534c02", speed="fast"),
-        turn_detection=MultilingualModel(),
+        stt="assemblyai/universal-streaming:en",
+        llm="google/gemini-2.0-flash",
+        tts="cartesia/sonic-3:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        # turn_detection=ml.MultilingualModel(),
         vad=silero.VAD.load(),
     )
 
     background_audio = BackgroundAudioPlayer(
         ambient_sound=AudioConfig(
-            str(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bg_noise.mp3")),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "bg_noise.mp3"),
             volume=1.0,
         ),
     )
 
     agent = DriveThruAgent(userdata=userdata, interrupt_handler=interrupt_handler)
 
-    # Bind interruption handling to ASR transcript events
-    @session.on("transcription")
-    async def _on_transcript(event):
-        await agent.on_transcription_event(
-            transcript=event.text,
-            confidence=getattr(event, "confidence", 1.0),
-            session=session,
-        )
+    # ✅ Proper async handler for transcription events
+    async def handle_transcriptions():
+        async for event in session.stream("transcription"):
+            asyncio.create_task(
+                agent.on_transcription_event(
+                    transcript=event.text,
+                    confidence=getattr(event, "confidence", 1.0),
+                    session=session,
+                )
+            )
 
-    await session.start(agent=agent, room=ctx.room)
+    # Run the listener in background
+    asyncio.create_task(handle_transcriptions())
+
+    # Start the session and background audio
+    await session.start(
+    agent=agent,
+    room=ctx.room,
+    room_input_options=RoomInputOptions(
+        noise_cancellation=noise_cancellation.BVC()
+    ),
+)
     await background_audio.start(room=ctx.room, agent_session=session)
 
 
